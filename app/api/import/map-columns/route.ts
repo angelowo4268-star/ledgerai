@@ -1,8 +1,9 @@
 import OpenAI from "openai";
 import { NextResponse } from "next/server";
 
-import type { ImportFieldKey } from "@/lib/import/types";
+import type { ImportFieldKey, ImportFormFieldKey } from "@/lib/import/types";
 import { buildHeuristicColumnMappings } from "@/lib/import/pipeline/column-mapping";
+import { buildFormColumnMappings } from "@/lib/import/pipeline/form-column-mapping";
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -22,21 +23,36 @@ const FIELD_LIST: ImportFieldKey[] = [
   "remarks",
 ];
 
+const FORM_FIELD_LIST: ImportFormFieldKey[] = [
+  "customer",
+  "product",
+  "amount",
+  "status",
+  "date",
+];
+
 export async function POST(request: Request) {
   try {
     const body = (await request.json()) as {
       headers?: string[];
       sampleRows?: string[][];
+      fields?: string[];
     };
 
     const headers = body.headers ?? [];
     const sampleRows = body.sampleRows ?? [];
+    const isFormMapping =
+      body.fields?.length === FORM_FIELD_LIST.length &&
+      FORM_FIELD_LIST.every((field) => body.fields?.includes(field));
 
     if (headers.length === 0) {
       return NextResponse.json({ error: "Missing headers" }, { status: 400 });
     }
 
-    const heuristic = buildHeuristicColumnMappings(headers);
+    const heuristic = isFormMapping
+      ? buildFormColumnMappings(headers)
+      : buildHeuristicColumnMappings(headers);
+    const allowedFields = isFormMapping ? FORM_FIELD_LIST : FIELD_LIST;
 
     if (!process.env.OPENAI_API_KEY) {
       return NextResponse.json({ mappings: heuristic });
@@ -57,7 +73,7 @@ Return JSON:
   ]
 }
 
-Allowed fields: ${FIELD_LIST.join(", ")}
+Allowed fields: ${allowedFields.join(", ")}
 Use null when no good match exists. Confidence is 0-100.`;
 
     const response = await client.responses.create({
@@ -80,7 +96,7 @@ Use null when no good match exists. Confidence is 0-100.`;
     };
 
     const aiMappings = (parsed.mappings ?? []).filter((item) =>
-      FIELD_LIST.includes(item.field)
+      allowedFields.includes(item.field as ImportFieldKey & ImportFormFieldKey)
     );
 
     const merged = heuristic.map((item) => {

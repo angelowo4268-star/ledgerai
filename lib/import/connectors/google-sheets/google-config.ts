@@ -14,6 +14,7 @@ export interface GoogleOAuthConfigStatus {
 const REQUIRED_APIS = [
   "Google Drive API",
   "Google Sheets API",
+  "Google Forms API",
 ] as const;
 
 export function getAppUrl() {

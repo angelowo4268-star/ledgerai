@@ -128,6 +128,7 @@ export async function repairRowsWithAi(rows: MappedImportRow[]) {
   });
 
   if (!response.ok) {
+    console.error("[Import Center] repair API failed:", response.status);
     return { rows, repairs: [] as DataRepair[] };
   }
 

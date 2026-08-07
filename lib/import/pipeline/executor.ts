@@ -16,13 +16,16 @@ function toConversationRecord(
   sourceLabel: string
 ): ConversationRecord {
   const createdAt = new Date().toISOString();
+  const platform = sourceLabel.includes("Google Forms")
+    ? "Google Forms"
+    : "Google Sheets";
 
   return {
     id: crypto.randomUUID(),
     orderNumber: row.orderId,
     customerName: row.customer,
     customerId: "",
-    platform: "Google Sheets",
+    platform,
     product: row.product,
     sku: "",
     quantity: row.quantity,
@@ -37,7 +40,7 @@ function toConversationRecord(
     shippingDate: "",
     customerNotified: "",
     notes: row.remarks,
-    orderDate: "",
+    orderDate: row.orderDate ?? "",
     confidence: 100,
     sourceLabel,
     createdAt,
@@ -103,7 +106,7 @@ export function executeImport(
       id: crypto.randomUUID(),
       name,
       customerId: row.orderId ? `GS-${row.orderId}` : "",
-      platform: "Google Sheets",
+      platform: sourceLabel.includes("Google Forms") ? "Google Forms" : "Google Sheets",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     });

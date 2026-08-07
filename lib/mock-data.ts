@@ -122,6 +122,7 @@ export const navItems = [
   { key: "voucherManagement", href: "/voucher-management", icon: "voucher" },
   { key: "companyRules", href: "/company-rules", icon: "scale" },
   { key: "chatRecords", href: "/chat-records", icon: "messages-square" },
+  { key: "aiChatParser", href: "/ai-chat-parser", icon: "bot-message" },
   { key: "communicationCenter", href: "/communication-center", icon: "message-circle" },
   { key: "aiReports", href: "/reports", icon: "bar-chart" },
   { key: "importCenter", href: "/import-center", icon: "cloud-download" },

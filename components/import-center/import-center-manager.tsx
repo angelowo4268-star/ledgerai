@@ -1,15 +1,38 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  ClipboardList,
   CloudDownload,
+  FolderOpen,
   Loader2,
   RefreshCw,
   Sheet,
   Wrench,
 } from "lucide-react";
+
+import {
+  ImportEmptyState,
+  ImportErrorAlert,
+  ImportLoadingBanner,
+  ImportResourceRow,
+  ImportResourceSkeleton,
+  ImportSectionCard,
+  ImportSourceCard,
+  ImportStatTile,
+  ImportStepFooter,
+  ImportStepIndicator,
+  ImportStepPanel,
+  ImportSuccessPanel,
+  ImportWarningCallout,
+  importCardClass,
+} from "@/components/import-center/import-center-ui";
+import { ImportMappingPanel } from "@/components/import-center/import-mapping-panel";
+import { ImportReviewExportMenu } from "@/components/import-center/import-review-export-menu";
+import { ImportReviewSummary } from "@/components/import-center/import-review-summary";
 
 import { PageHeader } from "@/components/layout/page-header";
 import { Badge } from "@/components/ui/badge";
@@ -34,37 +57,60 @@ import {
   SuccessToast,
   useSuccessToast,
 } from "@/components/ui/success-toast";
+import { googleFormsConnector } from "@/lib/import/connectors/google-forms/connector";
 import { googleSheetsConnector, fetchGoogleOAuthConfig } from "@/lib/import/connectors/google-sheets/connector";
 import type { GoogleOAuthConfigStatus } from "@/lib/import/connectors/google-sheets/google-config";
+import {
+  buildFormColumnMappings,
+  mapFormColumnsWithAi,
+  mergeFormColumnMappings,
+} from "@/lib/import/pipeline/form-column-mapping";
+import {
+  countRowsWithMissingFields,
+  mapRowsToFormImportRecords,
+} from "@/lib/import/pipeline/form-normalize";
 import {
   buildHeuristicColumnMappings,
   mapColumnsWithAi,
   mergeColumnMappings,
 } from "@/lib/import/pipeline/column-mapping";
 import { executeImport } from "@/lib/import/pipeline/executor";
+import { exportImportReviewToExcel } from "@/lib/import/export-review";
 import { mapRowsToImportRecords } from "@/lib/import/pipeline/normalize";
 import { repairImportRows } from "@/lib/import/pipeline/repair";
+import {
+  buildFormReviewSummary,
+  buildSheetReviewSummary,
+} from "@/lib/import/pipeline/review-summary";
 import { validateImportRows } from "@/lib/import/pipeline/validation";
 import type {
   ColumnMappingItem,
   DataRepair,
+  FormColumnMappingItem,
+  GoogleFormSummary,
   GoogleSpreadsheetSummary,
   GoogleWorksheetSummary,
   ImportFieldKey,
+  ImportFormFieldKey,
   ImportResult,
+  MappedFormImportRow,
   MappedImportRow,
   RawImportData,
   ValidationIssue,
 } from "@/lib/import/types";
-import { IMPORT_FIELD_KEYS } from "@/lib/import/types";
+import { IMPORT_FIELD_KEYS, IMPORT_FORM_FIELD_KEYS } from "@/lib/import/types";
 import { useTranslation } from "@/lib/i18n/context";
 import type { TranslationKey } from "@/lib/i18n/types";
 import { cn } from "@/lib/utils";
 
+type ImportSource = "google-sheets" | "google-forms";
+
 type WizardStep =
   | "connect"
+  | "source"
   | "spreadsheet"
   | "worksheet"
+  | "form"
   | "mapping"
   | "review"
   | "complete";
@@ -83,6 +129,31 @@ const FIELD_LABELS: Record<ImportFieldKey, TranslationKey> = {
   remarks: "importCenter.fieldRemarks",
 };
 
+const SHEET_REVIEW_EXPORT_FIELDS: ImportFieldKey[] = [
+  "customer",
+  "product",
+  "amount",
+  "paid",
+  "remaining",
+  "status",
+];
+
+const FORM_REVIEW_EXPORT_FIELDS: ImportFormFieldKey[] = [
+  "customer",
+  "product",
+  "amount",
+  "status",
+  "date",
+];
+
+const FORM_FIELD_LABELS: Record<ImportFormFieldKey, TranslationKey> = {
+  customer: "importCenter.fieldCustomer",
+  product: "importCenter.fieldProduct",
+  amount: "importCenter.fieldAmount",
+  status: "importCenter.fieldStatus",
+  date: "importCenter.fieldDate",
+};
+
 function formatModifiedDate(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
@@ -92,14 +163,92 @@ function formatModifiedDate(value: string) {
   return date.toLocaleString();
 }
 
+function getStepKeys(importSource: ImportSource | null): WizardStep[] {
+  if (importSource === "google-forms") {
+    return [
+      "connect",
+      "source",
+      "form",
+      "mapping",
+      "review",
+      "complete",
+    ];
+  }
+
+  if (importSource === "google-sheets") {
+    return [
+      "connect",
+      "source",
+      "spreadsheet",
+      "worksheet",
+      "mapping",
+      "review",
+      "complete",
+    ];
+  }
+
+  return ["connect", "source", "mapping", "review", "complete"];
+}
+
+function getPreviousStep(
+  current: WizardStep,
+  importSource: ImportSource | null
+): WizardStep | null {
+  const keys = getStepKeys(importSource);
+  const index = keys.indexOf(current);
+  if (index <= 0) {
+    return null;
+  }
+
+  return keys[index - 1];
+}
+
+interface CompleteSummary {
+  importedRows: number;
+  detectedColumns: number;
+  warnings: number;
+}
+
+function cloneColumnMappings(items: ColumnMappingItem[]) {
+  return items.map((item) => ({ ...item }));
+}
+
+function cloneFormMappings(items: FormColumnMappingItem[]) {
+  return items.map((item) => ({ ...item }));
+}
+
+function logImportPipeline(
+  stage: string,
+  rawData: RawImportData | null,
+  mappedRows: MappedImportRow[],
+  formRows: MappedFormImportRow[],
+  importSource: ImportSource | null
+) {
+  const reviewRows = importSource === "google-forms" ? formRows : mappedRows;
+
+  console.log(`[Import Pipeline] ${stage}`, {
+    rawRows: rawData?.rows?.length ?? null,
+    mappedRows: mappedRows.length,
+    formRows: formRows.length,
+    reviewRows: reviewRows.length,
+    importSource,
+  });
+}
+
 export function ImportCenterManager() {
   const { t } = useTranslation();
   const toast = useSuccessToast();
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
 
   const [step, setStep] = useState<WizardStep>("connect");
   const [connected, setConnected] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState<TranslationKey | null>(
+    null
+  );
   const [error, setError] = useState<string | null>(null);
+  const [maxVisitedStepIndex, setMaxVisitedStepIndex] = useState(0);
 
   const [spreadsheets, setSpreadsheets] = useState<GoogleSpreadsheetSummary[]>(
     []
@@ -119,6 +268,34 @@ export function ImportCenterManager() {
   const [oauthConfig, setOauthConfig] = useState<GoogleOAuthConfigStatus | null>(
     null
   );
+  const [importSource, setImportSource] = useState<ImportSource | null>(null);
+  const [forms, setForms] = useState<GoogleFormSummary[]>([]);
+  const [selectedForm, setSelectedForm] = useState<GoogleFormSummary | null>(
+    null
+  );
+  const [formMappings, setFormMappings] = useState<FormColumnMappingItem[]>([]);
+  const [formRows, setFormRows] = useState<MappedFormImportRow[]>([]);
+  const [baselineMappings, setBaselineMappings] = useState<ColumnMappingItem[]>(
+    []
+  );
+  const [baselineFormMappings, setBaselineFormMappings] = useState<
+    FormColumnMappingItem[]
+  >([]);
+  const [remappingField, setRemappingField] = useState<string | null>(null);
+  const [remappingAll, setRemappingAll] = useState(false);
+  const [completeSummary, setCompleteSummary] = useState<CompleteSummary | null>(
+    null
+  );
+
+  const beginLoading = useCallback((message: TranslationKey) => {
+    setLoading(true);
+    setLoadingMessage(message);
+  }, []);
+
+  const endLoading = useCallback(() => {
+    setLoading(false);
+    setLoadingMessage(null);
+  }, []);
 
   const loadOAuthConfig = useCallback(async () => {
     try {
@@ -136,15 +313,21 @@ export function ImportCenterManager() {
     const config = oauthConfig ?? (await loadOAuthConfig());
     if (!config?.configured) {
       setConnected(false);
-      return;
+      return false;
     }
 
-    const isConnected = await googleSheetsConnector.isConnected();
-    setConnected(isConnected);
-    if (isConnected) {
-      setStep((current) => (current === "connect" ? "spreadsheet" : current));
+    beginLoading("importCenter.loadingConnectingGoogle");
+    try {
+      const isConnected = await googleSheetsConnector.isConnected();
+      setConnected(isConnected);
+      if (isConnected) {
+        setStep((current) => (current === "connect" ? "source" : current));
+      }
+      return isConnected;
+    } finally {
+      endLoading();
     }
-  }, [loadOAuthConfig, oauthConfig]);
+  }, [beginLoading, endLoading, loadOAuthConfig, oauthConfig]);
 
   useEffect(() => {
     void loadOAuthConfig();
@@ -159,7 +342,11 @@ export function ImportCenterManager() {
     const message = params.get("message");
 
     if (params.get("google") === "connected") {
-      void refreshConnection();
+      void refreshConnection().then((isConnected) => {
+        if (isConnected) {
+          toast.show(t("importCenter.toastGoogleConnected"));
+        }
+      });
       window.history.replaceState({}, "", "/import-center");
     }
 
@@ -175,28 +362,112 @@ export function ImportCenterManager() {
       } else {
         setError(t("importCenter.connectFailed"));
       }
+      toast.showError(t("importCenter.toastGoogleConnectionFailed"));
       window.history.replaceState({}, "", "/import-center");
     }
-  }, [refreshConnection, t]);
+  }, [refreshConnection, t, toast]);
 
   const loadSpreadsheets = useCallback(async () => {
-    setLoading(true);
+    beginLoading("importCenter.loadingSpreadsheets");
     setError(null);
     try {
       const items = await googleSheetsConnector.listSpreadsheets();
       setSpreadsheets(items);
     } catch {
       setError(t("importCenter.loadSpreadsheetsFailed"));
+      toastRef.current.showError(t("importCenter.toastGoogleConnectionFailed"));
     } finally {
-      setLoading(false);
+      endLoading();
     }
-  }, [t]);
+  }, [beginLoading, endLoading, t]);
+
+  const loadForms = useCallback(async () => {
+    beginLoading("importCenter.loadingForms");
+    setError(null);
+    try {
+      const items = await googleFormsConnector.listForms();
+      setForms(items);
+    } catch {
+      setError(t("importCenter.loadFormsFailed"));
+      toastRef.current.showError(t("importCenter.toastGoogleConnectionFailed"));
+    } finally {
+      endLoading();
+    }
+  }, [beginLoading, endLoading, t]);
 
   useEffect(() => {
-    if (connected && step === "spreadsheet") {
-      void loadSpreadsheets();
+    if (!connected || step !== "spreadsheet" || importSource !== "google-sheets") {
+      return;
     }
-  }, [connected, step, loadSpreadsheets]);
+
+    let cancelled = false;
+
+    const run = async () => {
+      beginLoading("importCenter.loadingSpreadsheets");
+      setError(null);
+      try {
+        const items = await googleSheetsConnector.listSpreadsheets();
+        if (!cancelled) {
+          setSpreadsheets(items);
+        }
+      } catch {
+        if (!cancelled) {
+          setError(t("importCenter.loadSpreadsheetsFailed"));
+          toastRef.current.showError(
+            t("importCenter.toastGoogleConnectionFailed")
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          endLoading();
+        }
+      }
+    };
+
+    void run();
+
+    return () => {
+      cancelled = true;
+      endLoading();
+    };
+  }, [connected, step, importSource, beginLoading, endLoading, t]);
+
+  useEffect(() => {
+    if (!connected || step !== "form" || importSource !== "google-forms") {
+      return;
+    }
+
+    let cancelled = false;
+
+    const run = async () => {
+      beginLoading("importCenter.loadingForms");
+      setError(null);
+      try {
+        const items = await googleFormsConnector.listForms();
+        if (!cancelled) {
+          setForms(items);
+        }
+      } catch {
+        if (!cancelled) {
+          setError(t("importCenter.loadFormsFailed"));
+          toastRef.current.showError(
+            t("importCenter.toastGoogleConnectionFailed")
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          endLoading();
+        }
+      }
+    };
+
+    void run();
+
+    return () => {
+      cancelled = true;
+      endLoading();
+    };
+  }, [connected, step, importSource, beginLoading, endLoading, t]);
 
   const handleConnect = () => {
     if (!oauthConfig?.configured) {
@@ -213,15 +484,226 @@ export function ImportCenterManager() {
     await googleSheetsConnector.disconnect();
     setConnected(false);
     setStep("connect");
+    setMaxVisitedStepIndex(0);
+    setImportSource(null);
     setSpreadsheets([]);
     setWorksheets([]);
+    setForms([]);
     setSelectedSpreadsheet(null);
     setSelectedWorksheet(null);
+    setSelectedForm(null);
     setRawData(null);
+    setFormMappings([]);
+    setFormRows([]);
+    setBaselineMappings([]);
+    setBaselineFormMappings([]);
+  };
+
+  const handleSelectSource = (source: ImportSource) => {
+    setImportSource(source);
+    setError(null);
+    setRawData(null);
+    setFormMappings([]);
+    setFormRows([]);
+    setMappings([]);
+    setMappedRows([]);
+    setCreateVouchers(source === "google-forms");
+    setStep(source === "google-sheets" ? "spreadsheet" : "form");
+  };
+
+  const handleSelectForm = async (form: GoogleFormSummary) => {
+    if (loading) {
+      return;
+    }
+
+    beginLoading("importCenter.loadingFormResponses");
+    setError(null);
+    setSelectedForm(form);
+
+    try {
+      const data = await googleFormsConnector.loadFormResponses(form.id, form.name);
+      setRawData(data);
+
+      setLoadingMessage("importCenter.analyzingColumnsAi");
+      const heuristic = buildFormColumnMappings(data.headers);
+      let merged: FormColumnMappingItem[] = heuristic;
+
+      try {
+        const aiResult = await mapFormColumnsWithAi(
+          data.headers,
+          data.rows.slice(0, 5)
+        );
+        merged = mergeFormColumnMappings(heuristic, aiResult.mappings);
+        toast.show(t("importCenter.toastAiMappingCompleted"));
+      } catch {
+        toast.showError(t("importCenter.toastAiMappingFailed"));
+      }
+
+      setFormMappings(merged);
+      setBaselineFormMappings(cloneFormMappings(merged));
+
+      const rows = mapRowsToFormImportRecords(data, merged);
+      setFormRows(rows);
+      logImportPipeline(
+        "after-load-form",
+        data,
+        mappedRows,
+        rows,
+        "google-forms"
+      );
+      setStep("mapping");
+    } catch {
+      setError(t("importCenter.loadFormResponsesFailed"));
+      toast.showError(t("importCenter.toastGoogleConnectionFailed"));
+    } finally {
+      endLoading();
+    }
+  };
+
+  const applyFormMappings = useCallback(
+    (nextMappings: FormColumnMappingItem[]) => {
+      if (!rawData) {
+        return;
+      }
+
+      setFormMappings(nextMappings);
+      const rows = mapRowsToFormImportRecords(rawData, nextMappings);
+      setFormRows(rows);
+      logImportPipeline(
+        "after-apply-form-mappings",
+        rawData,
+        mappedRows,
+        rows,
+        "google-forms"
+      );
+    },
+    [rawData, mappedRows]
+  );
+
+  const applySheetMappings = useCallback(
+    (nextMappings: ColumnMappingItem[]) => {
+      if (!rawData) {
+        return;
+      }
+
+      setMappings(nextMappings);
+      const rows = mapRowsToImportRecords(rawData, nextMappings);
+      setMappedRows(rows);
+      setIssues(validateImportRows(rows));
+      logImportPipeline(
+        "after-apply-sheet-mappings",
+        rawData,
+        rows,
+        formRows,
+        "google-sheets"
+      );
+    },
+    [rawData, formRows]
+  );
+
+  const handleFormMappingChange = (
+    field: ImportFormFieldKey,
+    header: string
+  ) => {
+    if (!rawData) {
+      return;
+    }
+
+    const nextMappings = formMappings.map((item) =>
+      item.field === field
+        ? {
+            ...item,
+            header: header === "__none__" ? null : header,
+            confidence: header === "__none__" ? 0 : 100,
+          }
+        : item
+    );
+
+    applyFormMappings(nextMappings);
+  };
+
+  const handleResetFormMapping = (field: string) => {
+    const baseline = baselineFormMappings.find((item) => item.field === field);
+    if (!baseline) {
+      return;
+    }
+
+    const nextMappings = formMappings.map((item) =>
+      item.field === field ? { ...baseline } : item
+    );
+    applyFormMappings(nextMappings);
+  };
+
+  const handleResetAllFormMappings = () => {
+    applyFormMappings(cloneFormMappings(baselineFormMappings));
+  };
+
+  const handleAiRemapFormField = async (field: string) => {
+    if (!rawData || loading || remappingAll) {
+      return;
+    }
+
+    setRemappingField(field);
+    setError(null);
+
+    try {
+      const heuristic = buildFormColumnMappings(rawData.headers);
+      const aiResult = await mapFormColumnsWithAi(
+        rawData.headers,
+        rawData.rows.slice(0, 5)
+      );
+      const merged = mergeFormColumnMappings(heuristic, aiResult.mappings);
+      const aiField = merged.find((item) => item.field === field);
+
+      if (!aiField) {
+        return;
+      }
+
+      const nextMappings = formMappings.map((item) =>
+        item.field === field ? { ...aiField } : item
+      );
+      applyFormMappings(nextMappings);
+      toast.show(t("importCenter.toastAiMappingCompleted"));
+    } catch {
+      toast.showError(t("importCenter.toastAiMappingFailed"));
+    } finally {
+      setRemappingField(null);
+    }
+  };
+
+  const handleAiRemapAllFormMappings = async () => {
+    if (!rawData || loading || remappingField) {
+      return;
+    }
+
+    setRemappingAll(true);
+    setError(null);
+    beginLoading("importCenter.analyzingColumnsAi");
+
+    try {
+      const heuristic = buildFormColumnMappings(rawData.headers);
+      const aiResult = await mapFormColumnsWithAi(
+        rawData.headers,
+        rawData.rows.slice(0, 5)
+      );
+      const merged = mergeFormColumnMappings(heuristic, aiResult.mappings);
+      setBaselineFormMappings(cloneFormMappings(merged));
+      applyFormMappings(merged);
+      toast.show(t("importCenter.toastAiMappingCompleted"));
+    } catch {
+      toast.showError(t("importCenter.toastAiMappingFailed"));
+    } finally {
+      setRemappingAll(false);
+      endLoading();
+    }
   };
 
   const handleSelectSpreadsheet = async (spreadsheet: GoogleSpreadsheetSummary) => {
-    setLoading(true);
+    if (loading) {
+      return;
+    }
+
+    beginLoading("importCenter.loadingWorksheets");
     setError(null);
     setSelectedSpreadsheet(spreadsheet);
     try {
@@ -230,17 +712,18 @@ export function ImportCenterManager() {
       setStep("worksheet");
     } catch {
       setError(t("importCenter.loadWorksheetsFailed"));
+      toast.showError(t("importCenter.toastGoogleConnectionFailed"));
     } finally {
-      setLoading(false);
+      endLoading();
     }
   };
 
   const handleSelectWorksheet = async (worksheet: GoogleWorksheetSummary) => {
-    if (!selectedSpreadsheet) {
+    if (!selectedSpreadsheet || loading) {
       return;
     }
 
-    setLoading(true);
+    beginLoading("importCenter.loadingWorksheetData");
     setError(null);
     setSelectedWorksheet(worksheet);
 
@@ -253,22 +736,40 @@ export function ImportCenterManager() {
       );
       setRawData(data);
 
+      setLoadingMessage("importCenter.analyzingColumnsAi");
       const heuristic = buildHeuristicColumnMappings(data.headers);
-      const aiResult = await mapColumnsWithAi(
-        data.headers,
-        data.rows.slice(0, 5)
-      );
-      const merged = mergeColumnMappings(heuristic, aiResult.mappings);
+      let merged: ColumnMappingItem[] = heuristic;
+
+      try {
+        const aiResult = await mapColumnsWithAi(
+          data.headers,
+          data.rows.slice(0, 5)
+        );
+        merged = mergeColumnMappings(heuristic, aiResult.mappings);
+        toast.show(t("importCenter.toastAiMappingCompleted"));
+      } catch {
+        toast.showError(t("importCenter.toastAiMappingFailed"));
+      }
+
       setMappings(merged);
+      setBaselineMappings(cloneColumnMappings(merged));
 
       const rows = mapRowsToImportRecords(data, merged);
       setMappedRows(rows);
       setIssues(validateImportRows(rows));
+      logImportPipeline(
+        "after-load-worksheet",
+        data,
+        rows,
+        formRows,
+        "google-sheets"
+      );
       setStep("mapping");
     } catch {
       setError(t("importCenter.loadWorksheetFailed"));
+      toast.showError(t("importCenter.toastGoogleConnectionFailed"));
     } finally {
-      setLoading(false);
+      endLoading();
     }
   };
 
@@ -287,39 +788,317 @@ export function ImportCenterManager() {
         : item
     );
 
-    setMappings(nextMappings);
-    const rows = mapRowsToImportRecords(rawData, nextMappings);
-    setMappedRows(rows);
-    setIssues(validateImportRows(rows));
+    applySheetMappings(nextMappings);
   };
 
-  const handleContinueToReview = async () => {
-    setLoading(true);
+  const handleResetSheetMapping = (field: string) => {
+    const baseline = baselineMappings.find((item) => item.field === field);
+    if (!baseline) {
+      return;
+    }
+
+    const nextMappings = mappings.map((item) =>
+      item.field === field ? { ...baseline } : item
+    );
+    applySheetMappings(nextMappings);
+  };
+
+  const handleResetAllSheetMappings = () => {
+    applySheetMappings(cloneColumnMappings(baselineMappings));
+  };
+
+  const handleAiRemapSheetField = async (field: string) => {
+    if (!rawData || loading || remappingAll) {
+      return;
+    }
+
+    setRemappingField(field);
     setError(null);
 
     try {
-      const repaired = await repairImportRows(mappedRows);
+      const heuristic = buildHeuristicColumnMappings(rawData.headers);
+      const aiResult = await mapColumnsWithAi(
+        rawData.headers,
+        rawData.rows.slice(0, 5)
+      );
+      const merged = mergeColumnMappings(heuristic, aiResult.mappings);
+      const aiField = merged.find((item) => item.field === field);
+
+      if (!aiField) {
+        return;
+      }
+
+      const nextMappings = mappings.map((item) =>
+        item.field === field ? { ...aiField } : item
+      );
+      applySheetMappings(nextMappings);
+      toast.show(t("importCenter.toastAiMappingCompleted"));
+    } catch {
+      toast.showError(t("importCenter.toastAiMappingFailed"));
+    } finally {
+      setRemappingField(null);
+    }
+  };
+
+  const handleAiRemapAllSheetMappings = async () => {
+    if (!rawData || loading || remappingField) {
+      return;
+    }
+
+    setRemappingAll(true);
+    setError(null);
+    beginLoading("importCenter.analyzingColumnsAi");
+
+    try {
+      const heuristic = buildHeuristicColumnMappings(rawData.headers);
+      const aiResult = await mapColumnsWithAi(
+        rawData.headers,
+        rawData.rows.slice(0, 5)
+      );
+      const merged = mergeColumnMappings(heuristic, aiResult.mappings);
+      setBaselineMappings(cloneColumnMappings(merged));
+      applySheetMappings(merged);
+      toast.show(t("importCenter.toastAiMappingCompleted"));
+    } catch {
+      toast.showError(t("importCenter.toastAiMappingFailed"));
+    } finally {
+      setRemappingAll(false);
+      endLoading();
+    }
+  };
+
+  const handleContinueToReview = async () => {
+    if (loading || !rawData) {
+      return;
+    }
+
+    if (importSource === "google-forms") {
+      const rows = mapRowsToFormImportRecords(rawData, formMappings);
+      setFormRows(rows);
+      setRepairs([]);
+      setIssues([]);
+      logImportPipeline(
+        "enter-review-forms",
+        rawData,
+        mappedRows,
+        rows,
+        importSource
+      );
+      setStep("review");
+      return;
+    }
+
+    beginLoading("importCenter.checkingImportedData");
+    setError(null);
+
+    try {
+      const currentRows = mapRowsToImportRecords(rawData, mappings);
+      logImportPipeline(
+        "before-repair",
+        rawData,
+        currentRows,
+        formRows,
+        importSource
+      );
+
+      const repaired = await repairImportRows(currentRows);
       setMappedRows(repaired.rows);
       setRepairs(repaired.repairs);
       setIssues(validateImportRows(repaired.rows));
+      logImportPipeline(
+        "enter-review-sheets",
+        rawData,
+        repaired.rows,
+        formRows,
+        importSource
+      );
       setStep("review");
-    } catch {
+    } catch (error) {
+      console.error("[Import Center] continue to review failed:", error);
       setError(t("importCenter.repairFailed"));
+      toast.showError(t("importCenter.toastImportFailed"));
     } finally {
-      setLoading(false);
+      endLoading();
     }
   };
 
   const handleImport = () => {
-    if (!rawData) {
+    if (!rawData || loading) {
       return;
     }
 
-    const sourceLabel = `Google Sheets · ${rawData.sourceName} · ${rawData.sheetName}`;
-    const result = executeImport(mappedRows, sourceLabel, { createVouchers });
-    setImportResult(result);
-    setStep("complete");
-    toast.show(t("importCenter.importSuccess"));
+    beginLoading("importCenter.importingData");
+    setError(null);
+
+    try {
+      const warnings =
+        importSource === "google-forms"
+          ? countRowsWithMissingFields(formRows)
+          : issues.length;
+
+      if (importSource === "google-forms") {
+        const importRows: MappedImportRow[] = formRows.map((row) => ({
+          rowIndex: row.rowIndex,
+          customer: row.customer,
+          product: row.product,
+          quantity: 1,
+          amount: row.amount,
+          paid: 0,
+          remaining: row.amount,
+          currency: "TWD",
+          orderId: "",
+          paymentMethod: "",
+          status: row.status,
+          remarks: row.date,
+          orderDate: row.date,
+        }));
+        const sourceLabel = `Google Forms · ${rawData.sourceName}`;
+        const result = executeImport(importRows, sourceLabel, { createVouchers });
+        setImportResult(result);
+        setCompleteSummary({
+          importedRows: rawData.totalRows,
+          detectedColumns: rawData.headers.length,
+          warnings,
+        });
+        setStep("complete");
+        toast.show(t("importCenter.toastImportCompleted"));
+        return;
+      }
+
+      const sourceLabel = `Google Sheets · ${rawData.sourceName} · ${rawData.sheetName}`;
+      const result = executeImport(mappedRows, sourceLabel, { createVouchers });
+      setImportResult(result);
+      setCompleteSummary({
+        importedRows: rawData.totalRows,
+        detectedColumns: rawData.headers.length,
+        warnings,
+      });
+      setStep("complete");
+      toast.show(t("importCenter.toastImportCompleted"));
+    } catch {
+      setError(t("importCenter.repairFailed"));
+      toast.showError(t("importCenter.toastImportFailed"));
+    } finally {
+      endLoading();
+    }
+  };
+
+  const handleExportExcel = () => {
+    if (loading) {
+      return;
+    }
+
+    try {
+      if (importSource === "google-forms") {
+        const headers = FORM_REVIEW_EXPORT_FIELDS.map((field) =>
+          t(FORM_FIELD_LABELS[field])
+        );
+        const rows = formRows.map((row) => {
+          const record: Record<string, string | number> = {};
+
+          FORM_REVIEW_EXPORT_FIELDS.forEach((field, index) => {
+            const header = headers[index];
+            const isMissing = row.missingFields.includes(field);
+
+            if (field === "amount") {
+              record[header] = isMissing ? "" : row.amount;
+              return;
+            }
+
+            record[header] = isMissing ? "" : row[field];
+          });
+
+          return record;
+        });
+
+        console.log("Export rows:", rows, {
+          rawRows: rawData?.rows?.length ?? null,
+          mappedRows: mappedRows.length,
+          formRows: formRows.length,
+          reviewRows: formRows.length,
+          importSource,
+        });
+
+        exportImportReviewToExcel(rows, headers);
+      } else {
+        const headers = SHEET_REVIEW_EXPORT_FIELDS.map((field) =>
+          t(FIELD_LABELS[field])
+        );
+        const rows = mappedRows.map((row) => {
+          const record: Record<string, string | number> = {};
+
+          SHEET_REVIEW_EXPORT_FIELDS.forEach((field, index) => {
+            const header = headers[index];
+            const value = row[field];
+
+            if (typeof value === "number") {
+              record[header] = value;
+              return;
+            }
+
+            record[header] = value ?? "";
+          });
+
+          return record;
+        });
+
+        console.log("Export rows:", rows, {
+          rawRows: rawData?.rows?.length ?? null,
+          mappedRows: mappedRows.length,
+          formRows: formRows.length,
+          reviewRows: mappedRows.length,
+          importSource,
+        });
+
+        exportImportReviewToExcel(rows, headers);
+      }
+
+      toast.show(t("importCenter.toastExportExcelSuccess"));
+    } catch (error) {
+      console.error("[Import Center] Excel export failed:", error);
+      toast.showError(t("importCenter.toastExportExcelFailed"));
+    }
+  };
+
+  const handlePrevious = () => {
+    if (loading) {
+      return;
+    }
+
+    const previous = getPreviousStep(step, importSource);
+    if (previous) {
+      setStep(previous);
+      setError(null);
+    }
+  };
+
+  const handleStepClick = (targetStep: WizardStep, targetIndex: number) => {
+    if (loading || targetIndex > maxVisitedStepIndex || targetStep === step) {
+      return;
+    }
+
+    setStep(targetStep);
+    setError(null);
+  };
+
+  const handleImportAnother = () => {
+    setStep("source");
+    setImportResult(null);
+    setCompleteSummary(null);
+    setImportSource(null);
+    setSelectedSpreadsheet(null);
+    setSelectedWorksheet(null);
+    setSelectedForm(null);
+    setRawData(null);
+    setMappings([]);
+    setMappedRows([]);
+    setFormMappings([]);
+    setFormRows([]);
+    setBaselineMappings([]);
+    setBaselineFormMappings([]);
+    setIssues([]);
+    setRepairs([]);
+    setError(null);
   };
 
   const previewRows = useMemo(
@@ -331,53 +1110,160 @@ export function ImportCenterManager() {
     (item) => item.header && item.confidence < 70
   );
 
+  const lowConfidenceFormMappings = formMappings.filter(
+    (item) => item.header && item.confidence < 70
+  );
+
+  const formPreviewRows = useMemo(() => formRows.slice(0, 8), [formRows]);
+
+  useEffect(() => {
+    if (step !== "review") {
+      return;
+    }
+
+    const reviewRows = importSource === "google-forms" ? formRows : mappedRows;
+
+    console.log("[Import Pipeline] review-render", {
+      rawRows: rawData?.rows?.length ?? null,
+      mappedRows: mappedRows.length,
+      formRows: formRows.length,
+      reviewRows: reviewRows.length,
+      previewRows:
+        importSource === "google-forms"
+          ? formPreviewRows.length
+          : previewRows.length,
+      importSource,
+    });
+  }, [
+    step,
+    rawData,
+    mappedRows,
+    formRows,
+    formPreviewRows,
+    previewRows,
+    importSource,
+  ]);
+
+  const reviewSummaryLabels = useMemo(
+    () => ({
+      totalRows: t("importCenter.reviewTotalRows"),
+      totalColumns: t("importCenter.reviewTotalColumns"),
+      missingValues: t("importCenter.reviewMissingValues"),
+      invalidValues: t("importCenter.reviewInvalidValues"),
+      duplicateRecords: t("importCenter.reviewDuplicateRecords"),
+    }),
+    [t]
+  );
+
+  const sheetReviewSummary = useMemo(() => {
+    if (!rawData) {
+      return null;
+    }
+
+    return buildSheetReviewSummary(
+      mappedRows,
+      issues,
+      rawData.headers.length
+    );
+  }, [mappedRows, issues, rawData]);
+
+  const formReviewSummary = useMemo(() => {
+    if (!rawData) {
+      return null;
+    }
+
+    return buildFormReviewSummary(formRows, rawData.headers.length);
+  }, [formRows, rawData]);
+
+  const reviewExportLabels = useMemo(
+    () => ({
+      export: t("importCenter.export"),
+      excel: t("importCenter.exportExcelOption"),
+      csv: t("importCenter.exportCsvOption"),
+      googleSheets: t("importCenter.exportGoogleSheetsOption"),
+      pdf: t("importCenter.exportPdfOption"),
+    }),
+    [t]
+  );
+
+  useEffect(() => {
+    const keys = getStepKeys(importSource);
+    const index = keys.indexOf(step);
+    if (index >= 0) {
+      setMaxVisitedStepIndex((current) => Math.max(current, index));
+    }
+  }, [step, importSource]);
+
+  useEffect(() => {
+    const keys = getStepKeys(importSource);
+    const index = keys.indexOf(step);
+    setMaxVisitedStepIndex(index >= 0 ? index : 0);
+  }, [importSource]);
+
+  const stepItems = useMemo(() => {
+    const keys = getStepKeys(importSource);
+    const labels: Record<WizardStep, string> = {
+      connect: t("importCenter.stepConnect"),
+      source: t("importCenter.stepSource"),
+      spreadsheet: t("importCenter.stepSpreadsheet"),
+      worksheet: t("importCenter.stepWorksheet"),
+      form: t("importCenter.stepForm"),
+      mapping: t("importCenter.stepMapping"),
+      review: t("importCenter.stepReview"),
+      complete: t("importCenter.stepComplete"),
+    };
+
+    return keys.map((key) => [key, labels[key]] as const);
+  }, [importSource, t]);
+
+  const showPrevious = step !== "connect" && step !== "complete";
+  const loadingLabel = loadingMessage ? t(loadingMessage) : t("importCenter.loading");
+
   return (
     <>
-      <div className="space-y-6 animate-fade-in sm:space-y-8">
+      <div className="mx-auto max-w-5xl space-y-8 animate-fade-in pb-8">
         <PageHeader
           title={t("importCenter.title")}
           description={t("importCenter.description")}
         />
 
-        <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-6">
-          {(
-            [
-              ["connect", t("importCenter.stepConnect")],
-              ["spreadsheet", t("importCenter.stepSpreadsheet")],
-              ["worksheet", t("importCenter.stepWorksheet")],
-              ["mapping", t("importCenter.stepMapping")],
-              ["review", t("importCenter.stepReview")],
-              ["complete", t("importCenter.stepComplete")],
-            ] as const
-          ).map(([key, label]) => (
-            <div
-              key={key}
-              className={cn(
-                "rounded-xl border px-3 py-2 text-sm",
-                step === key
-                  ? "border-primary bg-primary/5 font-semibold text-primary"
-                  : "border-border/60 text-muted-foreground"
-              )}
-            >
-              {label}
-            </div>
-          ))}
-        </div>
+        <ImportStepIndicator
+          steps={stepItems}
+          currentStep={step}
+          maxVisitedStepIndex={maxVisitedStepIndex}
+          loading={loading}
+          onStepClick={(targetStep, index) =>
+            handleStepClick(targetStep as WizardStep, index)
+          }
+        />
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {loading && loadingMessage && (
+          <ImportLoadingBanner message={loadingLabel} />
+        )}
 
+        {error && (
+          <ImportErrorAlert
+            message={error}
+            onDismiss={() => setError(null)}
+            dismissLabel={t("common.cancel")}
+          />
+        )}
+
+        <ImportStepPanel stepKey={step}>
         {step === "connect" && (
-          <div className="space-y-4">
+          <div className="space-y-6">
             {!oauthReady && oauthConfig && (
               <Card className="border-amber-500/30 bg-amber-500/5 shadow-sm">
-                <CardHeader>
-                  <CardTitle className="flex items-center gap-2 text-lg">
+                <CardHeader className="space-y-1.5">
+                  <CardTitle className="flex items-center gap-2 text-base font-semibold sm:text-lg">
                     <AlertTriangle className="h-5 w-5 text-amber-600" />
                     {t("importCenter.setupTitle")}
                   </CardTitle>
-                  <CardDescription>{t("importCenter.setupHint")}</CardDescription>
+                  <CardDescription className="leading-relaxed">
+                    {t("importCenter.setupHint")}
+                  </CardDescription>
                 </CardHeader>
-                <CardContent className="space-y-4 text-sm">
+                <CardContent className="space-y-5 text-sm">
                   <div>
                     <p className="font-medium">{t("importCenter.setupMissingEnv")}</p>
                     <ul className="mt-2 list-disc space-y-1 pl-5 text-muted-foreground">
@@ -426,20 +1312,18 @@ export function ImportCenterManager() {
               </Card>
             )}
 
-            <Card className="border-border/60 shadow-sm">
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2 text-lg">
-                  <CloudDownload className="h-5 w-5 text-primary" />
-                  {t("importCenter.connectTitle")}
-                </CardTitle>
-                <CardDescription>{t("importCenter.connectHint")}</CardDescription>
-              </CardHeader>
-              <CardContent className="flex flex-col gap-3 sm:flex-row">
+            <ImportSectionCard
+              title={t("importCenter.connectTitle")}
+              description={t("importCenter.connectHint")}
+              icon={CloudDownload}
+            >
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
                 <Button
                   type="button"
+                  size="lg"
                   onClick={handleConnect}
-                  disabled={!oauthReady}
-                  className="h-11 touch-manipulation shadow-sm"
+                  disabled={!oauthReady || loading}
+                  className="h-11 w-full touch-manipulation shadow-sm sm:w-auto"
                 >
                   {t("importCenter.connectGoogle")}
                 </Button>
@@ -447,109 +1331,334 @@ export function ImportCenterManager() {
                   <Button
                     type="button"
                     variant="outline"
-                    onClick={() => setStep("spreadsheet")}
-                    className="h-11 touch-manipulation"
+                    size="lg"
+                    onClick={() => setStep("source")}
+                    disabled={loading}
+                    className="h-11 w-full touch-manipulation sm:w-auto"
                   >
                     {t("importCenter.continue")}
                   </Button>
                 )}
-              </CardContent>
-            </Card>
+              </div>
+            </ImportSectionCard>
           </div>
         )}
 
+        {step === "source" && (
+          <>
+            <ImportSectionCard
+              title={t("importCenter.sourceTitle")}
+              description={t("importCenter.sourceHint")}
+            >
+              <div className="grid gap-4 md:grid-cols-2">
+                <ImportSourceCard
+                  title={t("importCenter.sourceSheets")}
+                  description={t("importCenter.sourceSheetsHint")}
+                  icon={Sheet}
+                  disabled={loading}
+                  onClick={() => handleSelectSource("google-sheets")}
+                />
+                <ImportSourceCard
+                  title={t("importCenter.sourceForms")}
+                  description={t("importCenter.sourceFormsHint")}
+                  icon={ClipboardList}
+                  disabled={loading}
+                  onClick={() => handleSelectSource("google-forms")}
+                />
+              </div>
+            </ImportSectionCard>
+            <ImportStepFooter
+              showPrevious={showPrevious}
+              onPrevious={handlePrevious}
+              loading={loading}
+              previousLabel={t("importCenter.previous")}
+            />
+          </>
+        )}
+
         {step === "spreadsheet" && (
-          <Card className="border-border/60 shadow-sm">
-            <CardHeader className="flex flex-row items-center justify-between gap-4">
-              <div>
-                <CardTitle className="text-lg">
-                  {t("importCenter.spreadsheetsTitle")}
-                </CardTitle>
-                <CardDescription>
-                  {t("importCenter.spreadsheetsHint")}
-                </CardDescription>
-              </div>
-              <div className="flex gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => void loadSpreadsheets()}
-                >
-                  <RefreshCw className="h-4 w-4" />
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => void handleDisconnect()}
-                >
-                  {t("importCenter.disconnect")}
-                </Button>
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              {loading && (
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  {t("importCenter.loading")}
+          <>
+            <ImportSectionCard
+              title={t("importCenter.spreadsheetsTitle")}
+              description={t("importCenter.spreadsheetsHint")}
+              icon={Sheet}
+              actions={
+                <>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    disabled={loading}
+                    onClick={() => void loadSpreadsheets()}
+                    aria-label={t("importCenter.loadingSpreadsheets")}
+                  >
+                    <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={loading}
+                    onClick={() => void handleDisconnect()}
+                  >
+                    {t("importCenter.disconnect")}
+                  </Button>
+                </>
+              }
+            >
+              {loading && spreadsheets.length === 0 ? (
+                <ImportResourceSkeleton />
+              ) : !loading && spreadsheets.length === 0 ? (
+                <ImportEmptyState
+                  icon={FolderOpen}
+                  title={t("importCenter.noSpreadsheets")}
+                  description={t("importCenter.spreadsheetsHint")}
+                  action={
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void loadSpreadsheets()}
+                    >
+                      <RefreshCw className="h-4 w-4" />
+                      {t("importCenter.loadingSpreadsheets")}
+                    </Button>
+                  }
+                />
+              ) : (
+                <div className="space-y-3">
+                  {spreadsheets.map((spreadsheet) => (
+                    <ImportResourceRow
+                      key={spreadsheet.id}
+                      title={spreadsheet.name}
+                      subtitle={`${t("importCenter.lastModified")}: ${formatModifiedDate(spreadsheet.modifiedTime)}`}
+                      icon={Sheet}
+                      disabled={loading}
+                      onClick={() => void handleSelectSpreadsheet(spreadsheet)}
+                    />
+                  ))}
                 </div>
               )}
-              {!loading && spreadsheets.length === 0 && (
-                <p className="text-sm text-muted-foreground">
-                  {t("importCenter.noSpreadsheets")}
-                </p>
-              )}
-              {spreadsheets.map((spreadsheet) => (
-                <button
-                  key={spreadsheet.id}
-                  type="button"
-                  onClick={() => void handleSelectSpreadsheet(spreadsheet)}
-                  className="flex w-full items-center justify-between rounded-xl border border-border/60 px-4 py-3 text-left hover:border-primary/30 hover:bg-primary/5"
-                >
-                  <div>
-                    <p className="font-medium">{spreadsheet.name}</p>
-                    <p className="text-xs text-muted-foreground">
-                      {t("importCenter.lastModified")}:{" "}
-                      {formatModifiedDate(spreadsheet.modifiedTime)}
-                    </p>
-                  </div>
-                  <Sheet className="h-4 w-4 text-primary" />
-                </button>
-              ))}
-            </CardContent>
-          </Card>
+            </ImportSectionCard>
+            <ImportStepFooter
+              showPrevious={showPrevious}
+              onPrevious={handlePrevious}
+              loading={loading}
+              previousLabel={t("importCenter.previous")}
+            />
+          </>
         )}
 
         {step === "worksheet" && selectedSpreadsheet && (
-          <Card className="border-border/60 shadow-sm">
-            <CardHeader>
-              <CardTitle className="text-lg">
-                {t("importCenter.worksheetsTitle")}
-              </CardTitle>
-              <CardDescription>
-                {selectedSpreadsheet.name} · {t("importCenter.worksheetsHint")}
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              {worksheets.map((worksheet) => (
-                <button
-                  key={worksheet.sheetId}
-                  type="button"
-                  onClick={() => void handleSelectWorksheet(worksheet)}
-                  className="flex w-full items-center justify-between rounded-xl border border-border/60 px-4 py-3 text-left hover:border-primary/30 hover:bg-primary/5"
-                >
-                  <p className="font-medium">{worksheet.title}</p>
-                  <Badge variant="secondary">#{worksheet.index + 1}</Badge>
-                </button>
-              ))}
-            </CardContent>
-          </Card>
+          <>
+            <ImportSectionCard
+              title={t("importCenter.worksheetsTitle")}
+              description={`${selectedSpreadsheet.name} · ${t("importCenter.worksheetsHint")}`}
+              icon={Sheet}
+            >
+              {loading ? (
+                <ImportResourceSkeleton count={3} />
+              ) : (
+                <div className="space-y-3">
+                  {worksheets.map((worksheet) => (
+                    <ImportResourceRow
+                      key={worksheet.sheetId}
+                      title={worksheet.title}
+                      icon={Sheet}
+                      disabled={loading}
+                      onClick={() => void handleSelectWorksheet(worksheet)}
+                      trailing={
+                        <Badge variant="secondary">#{worksheet.index + 1}</Badge>
+                      }
+                    />
+                  ))}
+                </div>
+              )}
+            </ImportSectionCard>
+            <ImportStepFooter
+              showPrevious={showPrevious}
+              onPrevious={handlePrevious}
+              loading={loading}
+              previousLabel={t("importCenter.previous")}
+            />
+          </>
         )}
 
-        {step === "mapping" && rawData && (
-          <div className="space-y-4">
-            <Card className="border-border/60 shadow-sm">
+        {step === "form" && (
+          <>
+            <ImportSectionCard
+              title={t("importCenter.formsTitle")}
+              description={t("importCenter.formsHint")}
+              icon={ClipboardList}
+              actions={
+                <>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    disabled={loading}
+                    onClick={() => void loadForms()}
+                    aria-label={t("importCenter.loadingForms")}
+                  >
+                    <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={loading}
+                    onClick={() => void handleDisconnect()}
+                  >
+                    {t("importCenter.disconnect")}
+                  </Button>
+                </>
+              }
+            >
+              {loading && forms.length === 0 ? (
+                <ImportResourceSkeleton />
+              ) : !loading && forms.length === 0 ? (
+                <ImportEmptyState
+                  icon={FolderOpen}
+                  title={t("importCenter.noForms")}
+                  description={t("importCenter.formsHint")}
+                  action={
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void loadForms()}
+                    >
+                      <RefreshCw className="h-4 w-4" />
+                      {t("importCenter.loadingForms")}
+                    </Button>
+                  }
+                />
+              ) : (
+                <div className="space-y-3">
+                  {forms.map((form) => (
+                    <ImportResourceRow
+                      key={form.id}
+                      title={form.name}
+                      subtitle={`${t("importCenter.lastModified")}: ${formatModifiedDate(form.modifiedTime)}`}
+                      icon={ClipboardList}
+                      disabled={loading}
+                      onClick={() => void handleSelectForm(form)}
+                    />
+                  ))}
+                </div>
+              )}
+            </ImportSectionCard>
+            <ImportStepFooter
+              showPrevious={showPrevious}
+              onPrevious={handlePrevious}
+              loading={loading}
+              previousLabel={t("importCenter.previous")}
+            />
+          </>
+        )}
+
+        {step === "mapping" && rawData && importSource === "google-forms" && (
+          <div className="space-y-6">
+            <Card className={importCardClass}>
+              <CardHeader>
+                <CardTitle className="text-lg">
+                  {t("importCenter.previewTitle")}
+                </CardTitle>
+                <CardDescription>
+                  {rawData.sourceName} · {rawData.totalRows}{" "}
+                  {t("importCenter.responsesLabel")}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="overflow-x-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      {rawData.headers.map((header) => (
+                        <TableHead key={header}>{header}</TableHead>
+                      ))}
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {rawData.rows.slice(0, 5).map((row, index) => (
+                      <TableRow key={index}>
+                        {row.map((cell, cellIndex) => (
+                          <TableCell key={cellIndex}>{cell}</TableCell>
+                        ))}
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </CardContent>
+            </Card>
+
+            <Card className={importCardClass}>
+              <CardContent className="pt-6">
+                <ImportMappingPanel
+                  title={t("importCenter.formMappingTitle")}
+                  description={t("importCenter.formMappingHint")}
+                  fields={IMPORT_FORM_FIELD_KEYS.map((field) => ({
+                    key: field,
+                    label: t(FORM_FIELD_LABELS[field]),
+                  }))}
+                  mappings={formMappings}
+                  headers={rawData.headers}
+                  unmappedLabel={t("importCenter.unmapped")}
+                  mappedToLabel={t("importCenter.mappedTo")}
+                  confidenceLabel={t("importCenter.confidenceLabel")}
+                  resetLabel={t("importCenter.resetMapping")}
+                  aiRemapLabel={t("importCenter.aiRemap")}
+                  aiRemapAllLabel={t("importCenter.aiRemapAll")}
+                  resetAllLabel={t("importCenter.resetAllMappings")}
+                  disabled={loading}
+                  remappingField={remappingField}
+                  remappingAll={remappingAll}
+                  onChange={(field, header) =>
+                    handleFormMappingChange(field as ImportFormFieldKey, header)
+                  }
+                  onResetField={handleResetFormMapping}
+                  onAiRemapField={(field) => void handleAiRemapFormField(field)}
+                  onResetAll={handleResetAllFormMappings}
+                  onAiRemapAll={() => void handleAiRemapAllFormMappings()}
+                />
+              </CardContent>
+            </Card>
+
+            {countRowsWithMissingFields(formRows) > 0 && (
+              <ImportWarningCallout>
+                {t("importCenter.formMissingFieldsHint", {
+                  count: countRowsWithMissingFields(formRows),
+                })}
+              </ImportWarningCallout>
+            )}
+
+            {lowConfidenceFormMappings.length > 0 && (
+              <ImportWarningCallout>
+                {t("importCenter.lowConfidenceHint")}
+              </ImportWarningCallout>
+            )}
+
+            <ImportStepFooter
+              showPrevious={showPrevious}
+              onPrevious={handlePrevious}
+              loading={loading}
+              previousLabel={t("importCenter.previous")}
+            >
+              <Button
+                type="button"
+                size="lg"
+                onClick={() => void handleContinueToReview()}
+                disabled={loading || remappingAll || Boolean(remappingField)}
+                className="h-11 w-full touch-manipulation shadow-sm sm:w-auto"
+              >
+                {t("importCenter.continueReview")}
+              </Button>
+            </ImportStepFooter>
+          </div>
+        )}
+
+        {step === "mapping" && rawData && importSource === "google-sheets" && (
+          <div className="space-y-6">
+            <Card className={importCardClass}>
               <CardHeader>
                 <CardTitle className="text-lg">
                   {t("importCenter.previewTitle")}
@@ -581,66 +1690,56 @@ export function ImportCenterManager() {
               </CardContent>
             </Card>
 
-            <Card className="border-border/60 shadow-sm">
-              <CardHeader>
-                <CardTitle className="text-lg">
-                  {t("importCenter.mappingTitle")}
-                </CardTitle>
-                <CardDescription>{t("importCenter.mappingHint")}</CardDescription>
-              </CardHeader>
-              <CardContent className="grid gap-4 md:grid-cols-2">
-                {IMPORT_FIELD_KEYS.map((field) => {
-                  const mapping = mappings.find((item) => item.field === field);
-                  return (
-                    <div key={field} className="space-y-2">
-                      <Label htmlFor={`map-${field}`}>
-                        {t(FIELD_LABELS[field])}
-                        {mapping && mapping.confidence < 70 && mapping.header && (
-                          <Badge variant="secondary" className="ml-2">
-                            {mapping.confidence}%
-                          </Badge>
-                        )}
-                      </Label>
-                      <select
-                        id={`map-${field}`}
-                        value={mapping?.header ?? "__none__"}
-                        onChange={(event) =>
-                          handleMappingChange(field, event.target.value)
-                        }
-                        className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm"
-                      >
-                        <option value="__none__">
-                          {t("importCenter.unmapped")}
-                        </option>
-                        {rawData.headers.map((header) => (
-                          <option key={header} value={header}>
-                            {header}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  );
-                })}
+            <Card className={importCardClass}>
+              <CardContent className="pt-6">
+                <ImportMappingPanel
+                  title={t("importCenter.mappingTitle")}
+                  description={t("importCenter.mappingHint")}
+                  fields={IMPORT_FIELD_KEYS.map((field) => ({
+                    key: field,
+                    label: t(FIELD_LABELS[field]),
+                  }))}
+                  mappings={mappings}
+                  headers={rawData.headers}
+                  unmappedLabel={t("importCenter.unmapped")}
+                  mappedToLabel={t("importCenter.mappedTo")}
+                  confidenceLabel={t("importCenter.confidenceLabel")}
+                  resetLabel={t("importCenter.resetMapping")}
+                  aiRemapLabel={t("importCenter.aiRemap")}
+                  aiRemapAllLabel={t("importCenter.aiRemapAll")}
+                  resetAllLabel={t("importCenter.resetAllMappings")}
+                  disabled={loading}
+                  remappingField={remappingField}
+                  remappingAll={remappingAll}
+                  onChange={(field, header) =>
+                    handleMappingChange(field as ImportFieldKey, header)
+                  }
+                  onResetField={handleResetSheetMapping}
+                  onAiRemapField={(field) => void handleAiRemapSheetField(field)}
+                  onResetAll={handleResetAllSheetMappings}
+                  onAiRemapAll={() => void handleAiRemapAllSheetMappings()}
+                />
               </CardContent>
             </Card>
 
             {lowConfidenceMappings.length > 0 && (
-              <Card className="border-amber-500/30 bg-amber-500/5 shadow-sm">
-                <CardContent className="flex items-start gap-3 pt-6">
-                  <AlertTriangle className="mt-0.5 h-5 w-5 text-amber-600" />
-                  <p className="text-sm text-muted-foreground">
-                    {t("importCenter.lowConfidenceHint")}
-                  </p>
-                </CardContent>
-              </Card>
+              <ImportWarningCallout>
+                {t("importCenter.lowConfidenceHint")}
+              </ImportWarningCallout>
             )}
 
-            <div className="flex justify-end">
+            <ImportStepFooter
+              showPrevious={showPrevious}
+              onPrevious={handlePrevious}
+              loading={loading}
+              previousLabel={t("importCenter.previous")}
+            >
               <Button
                 type="button"
+                size="lg"
                 onClick={() => void handleContinueToReview()}
-                disabled={loading}
-                className="h-11 touch-manipulation shadow-sm"
+                disabled={loading || remappingAll || Boolean(remappingField)}
+                className="h-11 w-full touch-manipulation shadow-sm sm:w-auto"
               >
                 {loading ? (
                   <>
@@ -651,73 +1750,237 @@ export function ImportCenterManager() {
                   t("importCenter.continueReview")
                 )}
               </Button>
-            </div>
+            </ImportStepFooter>
           </div>
         )}
 
-        {step === "review" && (
-          <div className="space-y-4">
-            <Card className="border-border/60 shadow-sm">
+        {step === "review" && importSource === "google-forms" && formReviewSummary && (
+          <div className="space-y-6">
+            <ImportReviewSummary
+              summary={formReviewSummary}
+              labels={reviewSummaryLabels}
+            />
+
+            <ImportSectionCard
+              title={t("importCenter.formReviewTitle")}
+              description={t("importCenter.formReviewHint")}
+              icon={AlertTriangle}
+              iconClassName="text-amber-600"
+            >
+              {countRowsWithMissingFields(formRows) === 0 ? (
+                <ImportEmptyState
+                  icon={CheckCircle2}
+                  title={t("importCenter.formNoMissingFields")}
+                />
+              ) : (
+                <div className="space-y-2">
+                  {formRows
+                    .filter((row) => row.missingFields.length > 0)
+                    .slice(0, 10)
+                    .map((row) => (
+                      <div
+                        key={row.rowIndex}
+                        className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5 text-sm"
+                      >
+                        <span className="font-medium">
+                          {t("importCenter.row")} {row.rowIndex}:
+                        </span>{" "}
+                        {t("importCenter.formMissingFieldsRow", {
+                          fields: row.missingFields
+                            .map((field) => t(FORM_FIELD_LABELS[field]))
+                            .join(", "),
+                        })}
+                      </div>
+                    ))}
+                </div>
+              )}
+            </ImportSectionCard>
+
+            <Card className={importCardClass}>
               <CardHeader>
-                <CardTitle className="flex items-center gap-2 text-lg">
-                  <AlertTriangle className="h-5 w-5 text-amber-600" />
-                  {t("importCenter.validationTitle")}
+                <CardTitle className="text-lg">
+                  {t("importCenter.mappedPreviewTitle")}
                 </CardTitle>
               </CardHeader>
-              <CardContent className="space-y-2">
-                {issues.length === 0 && (
-                  <p className="text-sm text-muted-foreground">
-                    {t("importCenter.noIssues")}
-                  </p>
-                )}
-                {issues.map((issue, index) => (
-                  <div
-                    key={`${issue.rowIndex}-${issue.code}-${index}`}
-                    className="rounded-lg border border-border/60 px-3 py-2 text-sm"
-                  >
-                    <span className="font-medium">
-                      {t("importCenter.row")} {issue.rowIndex}:
-                    </span>{" "}
-                    {issue.message}
-                  </div>
-                ))}
+              <CardContent className="overflow-x-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>{t("importCenter.fieldCustomer")}</TableHead>
+                      <TableHead>{t("importCenter.fieldProduct")}</TableHead>
+                      <TableHead>{t("importCenter.fieldAmount")}</TableHead>
+                      <TableHead>{t("importCenter.fieldStatus")}</TableHead>
+                      <TableHead>{t("importCenter.fieldDate")}</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {formPreviewRows.map((row) => (
+                      <TableRow key={row.rowIndex}>
+                        <TableCell
+                          className={
+                            row.missingFields.includes("customer")
+                              ? "text-destructive"
+                              : undefined
+                          }
+                        >
+                          {row.customer || "—"}
+                        </TableCell>
+                        <TableCell
+                          className={
+                            row.missingFields.includes("product")
+                              ? "text-destructive"
+                              : undefined
+                          }
+                        >
+                          {row.product || "—"}
+                        </TableCell>
+                        <TableCell
+                          className={
+                            row.missingFields.includes("amount")
+                              ? "text-destructive"
+                              : undefined
+                          }
+                        >
+                          {row.amount || "—"}
+                        </TableCell>
+                        <TableCell
+                          className={
+                            row.missingFields.includes("status")
+                              ? "text-destructive"
+                              : undefined
+                          }
+                        >
+                          {row.status || "—"}
+                        </TableCell>
+                        <TableCell
+                          className={
+                            row.missingFields.includes("date")
+                              ? "text-destructive"
+                              : undefined
+                          }
+                        >
+                          {row.date || "—"}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
               </CardContent>
             </Card>
 
             <Card className="border-border/60 shadow-sm">
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2 text-lg">
-                  <Wrench className="h-5 w-5 text-primary" />
-                  {t("importCenter.repairsTitle")}
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                {repairs.length === 0 && (
-                  <p className="text-sm text-muted-foreground">
-                    {t("importCenter.noRepairs")}
-                  </p>
-                )}
-                {repairs.map((repair, index) => (
-                  <div
-                    key={`${repair.rowIndex}-${repair.field}-${index}`}
-                    className="rounded-lg border border-border/60 px-3 py-2 text-sm"
-                  >
-                    <p className="font-medium">
-                      {t("importCenter.row")} {repair.rowIndex} ·{" "}
-                      {t(FIELD_LABELS[repair.field])}
-                    </p>
-                    <p className="text-muted-foreground">
-                      {repair.originalValue || "—"} → {repair.repairedValue}
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      {repair.reason}
-                    </p>
-                  </div>
-                ))}
+              <CardContent className="flex items-center gap-3 pt-6">
+                <input
+                  id="create-vouchers-forms"
+                  type="checkbox"
+                  checked={createVouchers}
+                  onChange={(event) => setCreateVouchers(event.target.checked)}
+                  className="h-4 w-4 rounded border-border text-primary"
+                />
+                <Label htmlFor="create-vouchers-forms">
+                  {t("importCenter.createVouchers")}
+                </Label>
               </CardContent>
             </Card>
 
-            <Card className="border-border/60 shadow-sm">
+            <ImportStepFooter
+              showPrevious={showPrevious}
+              onPrevious={handlePrevious}
+              loading={loading}
+              previousLabel={t("importCenter.previous")}
+            >
+              <ImportReviewExportMenu
+                disabled={loading}
+                labels={reviewExportLabels}
+                onExportExcel={handleExportExcel}
+              />
+              <Button
+                type="button"
+                size="lg"
+                onClick={handleImport}
+                disabled={loading}
+                className="h-11 w-full touch-manipulation shadow-sm sm:w-auto"
+              >
+                {loading ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    {t("importCenter.importingData")}
+                  </>
+                ) : (
+                  t("importCenter.confirmImport")
+                )}
+              </Button>
+            </ImportStepFooter>
+          </div>
+        )}
+
+        {step === "review" && importSource === "google-sheets" && sheetReviewSummary && (
+          <div className="space-y-6">
+            <ImportReviewSummary
+              summary={sheetReviewSummary}
+              labels={reviewSummaryLabels}
+            />
+
+            <ImportSectionCard
+              title={t("importCenter.validationTitle")}
+              icon={AlertTriangle}
+              iconClassName="text-amber-600"
+            >
+              {issues.length === 0 ? (
+                <ImportEmptyState
+                  icon={CheckCircle2}
+                  title={t("importCenter.noIssues")}
+                />
+              ) : (
+                <div className="space-y-2">
+                  {issues.map((issue, index) => (
+                    <div
+                      key={`${issue.rowIndex}-${issue.code}-${index}`}
+                      className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5 text-sm"
+                    >
+                      <span className="font-medium">
+                        {t("importCenter.row")} {issue.rowIndex}:
+                      </span>{" "}
+                      {issue.message}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </ImportSectionCard>
+
+            <ImportSectionCard
+              title={t("importCenter.repairsTitle")}
+              icon={Wrench}
+            >
+              {repairs.length === 0 ? (
+                <ImportEmptyState
+                  icon={CheckCircle2}
+                  title={t("importCenter.noRepairs")}
+                />
+              ) : (
+                <div className="space-y-2">
+                  {repairs.map((repair, index) => (
+                    <div
+                      key={`${repair.rowIndex}-${repair.field}-${index}`}
+                      className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5 text-sm"
+                    >
+                      <p className="font-medium">
+                        {t("importCenter.row")} {repair.rowIndex} ·{" "}
+                        {t(FIELD_LABELS[repair.field])}
+                      </p>
+                      <p className="text-muted-foreground">
+                        {repair.originalValue || "—"} → {repair.repairedValue}
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        {repair.reason}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </ImportSectionCard>
+
+            <Card className={importCardClass}>
               <CardHeader>
                 <CardTitle className="text-lg">
                   {t("importCenter.mappedPreviewTitle")}
@@ -766,70 +2029,104 @@ export function ImportCenterManager() {
               </CardContent>
             </Card>
 
-            <div className="flex justify-end gap-3">
+            <ImportStepFooter
+              showPrevious={showPrevious}
+              onPrevious={handlePrevious}
+              loading={loading}
+              previousLabel={t("importCenter.previous")}
+            >
+              <ImportReviewExportMenu
+                disabled={loading}
+                labels={reviewExportLabels}
+                onExportExcel={handleExportExcel}
+              />
               <Button
                 type="button"
-                variant="outline"
-                onClick={() => setStep("mapping")}
-                className="h-11 touch-manipulation"
-              >
-                {t("common.cancel")}
-              </Button>
-              <Button
-                type="button"
+                size="lg"
                 onClick={handleImport}
-                className="h-11 touch-manipulation shadow-sm"
+                disabled={loading}
+                className="h-11 w-full touch-manipulation shadow-sm sm:w-auto"
               >
-                {t("importCenter.confirmImport")}
+                {loading ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    {t("importCenter.importingData")}
+                  </>
+                ) : (
+                  t("importCenter.confirmImport")
+                )}
               </Button>
-            </div>
+            </ImportStepFooter>
           </div>
         )}
 
-        {step === "complete" && importResult && (
-          <Card className="border-primary/20 bg-primary/5 shadow-sm">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-lg">
-                <CheckCircle2 className="h-5 w-5 text-primary" />
-                {t("importCenter.completeTitle")}
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-              <div className="rounded-xl border border-border/60 bg-background px-4 py-3">
-                <p className="text-sm text-muted-foreground">
-                  {t("importCenter.resultCustomers")}
-                </p>
-                <p className="text-2xl font-bold">
-                  {importResult.customersCreated + importResult.customersUpdated}
-                </p>
-              </div>
-              <div className="rounded-xl border border-border/60 bg-background px-4 py-3">
-                <p className="text-sm text-muted-foreground">
-                  {t("importCenter.resultOrders")}
-                </p>
-                <p className="text-2xl font-bold">{importResult.ordersCreated}</p>
-              </div>
-              <div className="rounded-xl border border-border/60 bg-background px-4 py-3">
-                <p className="text-sm text-muted-foreground">
-                  {t("importCenter.resultCommunication")}
-                </p>
-                <p className="text-2xl font-bold">
-                  {importResult.communicationRecordsCreated}
-                </p>
-              </div>
-              <div className="rounded-xl border border-border/60 bg-background px-4 py-3">
-                <p className="text-sm text-muted-foreground">
-                  {t("importCenter.resultVouchers")}
-                </p>
-                <p className="text-2xl font-bold">
-                  {importResult.vouchersCreated}
-                </p>
-              </div>
-            </CardContent>
-          </Card>
+        {step === "complete" && importResult && completeSummary && (
+          <ImportSuccessPanel
+            title={t("importCenter.completeTitle")}
+            subtitle={t("importCenter.completeSubtitle")}
+            summarySectionLabel={t("importCenter.completeSummarySection")}
+            recordsSectionLabel={t("importCenter.completeRecordsSection")}
+            summaryTiles={
+              <>
+                <ImportStatTile
+                  label={t("importCenter.completeImportedRows")}
+                  value={completeSummary.importedRows}
+                  highlight
+                />
+                <ImportStatTile
+                  label={t("importCenter.completeDetectedColumns")}
+                  value={completeSummary.detectedColumns}
+                />
+                <ImportStatTile
+                  label={t("importCenter.completeWarnings")}
+                  value={completeSummary.warnings}
+                />
+              </>
+            }
+            resultTiles={
+              <>
+                <ImportStatTile
+                  label={t("importCenter.resultCustomers")}
+                  value={
+                    importResult.customersCreated + importResult.customersUpdated
+                  }
+                />
+                <ImportStatTile
+                  label={t("importCenter.resultOrders")}
+                  value={importResult.ordersCreated}
+                />
+                <ImportStatTile
+                  label={t("importCenter.resultCommunication")}
+                  value={importResult.communicationRecordsCreated}
+                />
+                <ImportStatTile
+                  label={t("importCenter.resultVouchers")}
+                  value={importResult.vouchersCreated}
+                />
+              </>
+            }
+            primaryAction={
+              <Button asChild size="lg" className="h-11 w-full shadow-sm sm:flex-1">
+                <Link href="/">{t("importCenter.goToDashboard")}</Link>
+              </Button>
+            }
+            secondaryAction={
+              <Button
+                type="button"
+                variant="outline"
+                size="lg"
+                onClick={handleImportAnother}
+                className="h-11 w-full sm:flex-1"
+              >
+                {t("importCenter.importAnother")}
+              </Button>
+            }
+          />
         )}
+        </ImportStepPanel>
 
-        <Card className="border-dashed border-border/60 shadow-sm">
+        {step !== "complete" && (
+        <Card className="border-dashed border-border/60 bg-muted/10 shadow-sm">
           <CardHeader>
             <CardTitle className="text-base">
               {t("importCenter.futureConnectorsTitle")}
@@ -840,7 +2137,6 @@ export function ImportCenterManager() {
           </CardHeader>
           <CardContent className="flex flex-wrap gap-2">
             {[
-              "Google Forms",
               "Excel",
               "CSV",
               "Discord",
@@ -854,9 +2150,14 @@ export function ImportCenterManager() {
             ))}
           </CardContent>
         </Card>
+        )}
       </div>
 
-      <SuccessToast message={toast.message} onDismiss={toast.dismiss} />
+      <SuccessToast
+        message={toast.message}
+        variant={toast.variant}
+        onDismiss={toast.dismiss}
+      />
     </>
   );
 }

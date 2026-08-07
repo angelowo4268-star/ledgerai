@@ -1,10 +1,15 @@
 import { googleSheetsConnector } from "@/lib/import/connectors/google-sheets/connector";
+import { googleFormsConnector } from "@/lib/import/connectors/google-forms/connector";
 import type { ImportConnector } from "@/lib/import/connectors/types";
 
 const connectors: ImportConnector[] = [googleSheetsConnector];
 
 export function getImportConnectors(): ImportConnector[] {
   return connectors;
+}
+
+export function getGoogleConnectors() {
+  return [googleSheetsConnector, googleFormsConnector];
 }
 
 export function getImportConnector(id: string): ImportConnector | undefined {

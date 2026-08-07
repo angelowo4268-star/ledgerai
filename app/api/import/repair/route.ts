@@ -56,8 +56,13 @@ Only include repairs that improve data quality. Keep numeric fields numeric.`;
       repairs?: DataRepair[];
     };
 
+    const aiRows =
+      Array.isArray(parsed.rows) && parsed.rows.length > 0
+        ? parsed.rows
+        : ruleBased.rows;
+
     return NextResponse.json({
-      rows: parsed.rows ?? ruleBased.rows,
+      rows: aiRows,
       repairs: [...ruleBased.repairs, ...(parsed.repairs ?? [])],
     });
   } catch (error) {

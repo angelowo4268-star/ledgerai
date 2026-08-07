@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import {
   BarChart3,
   BookOpen,
+  BrainCircuit,
   ChevronLeft,
   ChevronRight,
   CloudDownload,
@@ -42,6 +43,7 @@ const iconMap = {
   scale: Scale,
   "message-circle": MessageCircle,
   "messages-square": MessagesSquare,
+  "bot-message": BrainCircuit,
   "bar-chart": BarChart3,
   "cloud-download": CloudDownload,
   "file-spreadsheet": FileSpreadsheet,

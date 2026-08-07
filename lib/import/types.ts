@@ -64,6 +64,7 @@ export interface MappedImportRow {
   paymentMethod: string;
   status: string;
   remarks: string;
+  orderDate?: string;
 }
 
 export type ValidationIssueCode =
@@ -115,4 +116,41 @@ export interface GoogleWorksheetSummary {
   sheetId: number;
   title: string;
   index: number;
+}
+
+export type ImportFormFieldKey =
+  | "customer"
+  | "product"
+  | "amount"
+  | "status"
+  | "date";
+
+export const IMPORT_FORM_FIELD_KEYS: ImportFormFieldKey[] = [
+  "customer",
+  "product",
+  "amount",
+  "status",
+  "date",
+];
+
+export interface FormColumnMappingItem {
+  field: ImportFormFieldKey;
+  header: string | null;
+  confidence: number;
+}
+
+export interface MappedFormImportRow {
+  rowIndex: number;
+  customer: string;
+  product: string;
+  amount: number;
+  status: string;
+  date: string;
+  missingFields: ImportFormFieldKey[];
+}
+
+export interface GoogleFormSummary {
+  id: string;
+  name: string;
+  modifiedTime: string;
 }
