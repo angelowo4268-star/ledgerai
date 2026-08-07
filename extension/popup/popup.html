@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LedgerAI</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <header class="popup__header">
+        <img src="../icons/icon48.png" alt="" class="popup__icon" width="32" height="32" />
+        <h1 class="popup__title">LedgerAI</h1>
+      </header>
+
+      <p id="status" class="popup__status">Checking page...</p>
+
+      <button id="importButton" type="button" class="popup__button" disabled>
+        Import Current Chat
+      </button>
+
+      <section class="popup__output">
+        <h2 class="popup__output-title">Collected Chat</h2>
+        <pre id="chatOutput" class="popup__chat-output">No chat imported yet.</pre>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

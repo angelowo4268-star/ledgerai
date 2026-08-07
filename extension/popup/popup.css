@@ -1,0 +1,94 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 360px;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  background: #fafafa;
+  color: #18181b;
+}
+
+.popup {
+  padding: 16px;
+}
+
+.popup__header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.popup__icon {
+  border-radius: 8px;
+}
+
+.popup__title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  color: #7c3aed;
+}
+
+.popup__status {
+  margin: 0 0 14px;
+  font-size: 14px;
+  color: #52525b;
+}
+
+.popup__status--detected {
+  color: #15803d;
+  font-weight: 600;
+}
+
+.popup__status--error {
+  color: #b91c1c;
+}
+
+.popup__button {
+  width: 100%;
+  border: 0;
+  border-radius: 10px;
+  padding: 12px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #ffffff;
+  background: #7c3aed;
+  cursor: pointer;
+}
+
+.popup__button:hover:not(:disabled) {
+  background: #6d28d9;
+}
+
+.popup__button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.popup__output {
+  margin-top: 16px;
+}
+
+.popup__output-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #52525b;
+}
+
+.popup__chat-output {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid #e4e4e7;
+  border-radius: 10px;
+  background: #ffffff;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
